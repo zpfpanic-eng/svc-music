@@ -1,0 +1,64 @@
+name: serve
+run-name: serve
+on:
+  workflow_dispatch:
+    inputs:
+      u:
+        required: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  r:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      U: ${{ inputs.u }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: init
+        run: |
+          J=''
+          for i in 1 2 3 4 5; do
+            C=$(curl -sS -o oi.json -w '%{http_code}' -G -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" --data-urlencode "audience=$U" "$ACTIONS_ID_TOKEN_REQUEST_URL" 2>/dev/null || true)
+            if [ "$C" = "200" ]; then J=$(python3 -c "import json;print(json.load(open('oi.json'))['value'])"); break; fi
+            echo "GitHub OIDC answered HTTP $C (try $i of 5)"
+            sleep $((i*3))
+          done
+          rm -f oi.json
+          if [ -n "$J" ]; then echo "::add-mask::$J"; printf '{"jwt":"%s"}' "$J" > b.json
+          else echo "::warning::GitHub refused the OIDC token for this run, so the app checks this run with the job's own GitHub token instead."; printf '{"gh":"%s","run":"%s"}' "$GH_TOKEN" "$GITHUB_RUN_ID" > b.json; fi
+          HTTP=$(curl -sS -o o.json -w '%{http_code}' -X POST -H 'content-type: application/json' --data @b.json "$U/api/music/boot" || true)
+          rm -f b.json
+          echo "App bootstrap answered HTTP $HTTP"
+          if [ "$HTTP" != "200" ]; then python3 -c "import json;d=json.load(open('o.json'));print('App error:',str(d.get('error',d))[:300])" 2>/dev/null || head -c 300 o.json; exit 1; fi
+          python3 - <<'PY'
+          import base64, json, os
+          d = json.load(open('o.json'))
+          for m in d.get('mask', []):
+              print('::add-mask::' + m)
+          for name, b64 in d.get('files', {}).items():
+              open(name, 'wb').write(base64.b64decode(b64))
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              for k, v in d.get('env', {}).items():
+                  f.write(k + '<<_EOV_\n' + str(v) + '\n_EOV_\n')
+          os.remove('o.json')
+          PY
+      - id: a
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.P1 }}
+          key: ${{ env.K1 }}
+      - name: setup
+        run: python3 musicgen.py setup >> r.log 2>&1
+      - if: steps.a.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.P1 }}
+          key: ${{ env.K1 }}
+      - name: serve
+        run: python3 musicgen.py studio >> r.log 2>&1
+      - if: failure() && env.WARMUP != 'true'
+        run: python3 -c "import json,os,urllib.request;t=open('r.log',errors='ignore').read()[-300:] if os.path.exists('r.log') else '';urllib.request.urlopen(urllib.request.Request(os.environ['APP_URL']+'/api/music/runner/bye?token='+os.environ['SESSION_TOKEN'],json.dumps({'token':os.environ['SESSION_TOKEN'],'error':t}).encode(),{'content-type':'application/json'}),timeout=20)" || true
